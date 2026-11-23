@@ -269,11 +269,27 @@ void convert_user_problem(const user_problem_t<i_t, f_t>& user_problem,
                           std::vector<i_t>& new_slacks,
                           dualize_info_t<i_t, f_t>& dualize_info);
 
+// `drop_rel_tol` is an opt-in numerical-hygiene switch for heuristic callers
+// (currently the branch-and-bound sub-MIP): each row i loses the entries with
+// |a_ij| <= drop_rel_tol * max_k |a_ik|.
+//
+// Entries at that level are indistinguishable from the round-off left by floating-point
+// row combinations (see NVIDIA/cuopt#2290), and PaPILO's sparsify may pick them as
+// cancellation pivots. They are not guaranteed to be noise, though: for a column that
+// can take a large value even a tiny coefficient can move the row activity. The filter
+// is therefore heuristic only and the tolerance must stay at the round-off level.
+//
+// The filter only rewrites the returned matrix. `lp`, the objective, the right-hand
+// sides, the bounds and the dimensions are untouched, so the converted problem is a
+// *different* problem in general: dropping an entry from an equality row changes the
+// row. Callers must validate any candidate solution against the original LP.
+// `drop_rel_tol <= 0` keeps the exact conversion.
 template <typename i_t, typename f_t>
 void convert_lp_to_user_problem(const lp_problem_t<i_t, f_t>& lp,
                                 const std::vector<variable_type_t>& var_types,
                                 const simplex_solver_settings_t<i_t, f_t>& settings,
-                                user_problem_t<i_t, f_t>& user_problem);
+                                user_problem_t<i_t, f_t>& user_problem,
+                                f_t drop_rel_tol = f_t{0});
 
 template <typename i_t, typename f_t>
 void convert_user_problem_with_guess(const user_problem_t<i_t, f_t>& user_problem,

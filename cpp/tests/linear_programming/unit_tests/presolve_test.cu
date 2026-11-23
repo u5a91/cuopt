@@ -11,6 +11,7 @@
 #include <cuopt/mathematical_optimization/io/parser.hpp>
 #include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
 #include <cuopt/mathematical_optimization/solve.hpp>
+#include <dual_simplex/presolve.hpp>
 #include <linear_algebra/sort_csr.cuh>
 #include <pdlp/utils.cuh>
 #include <presolve/third_party_presolve.hpp>
@@ -1495,6 +1496,270 @@ TEST(submip_presolve, ex9_reduced_to_residual_row)
     objective += obj_coeffs[j] * full_solution[j];
   }
   EXPECT_NEAR(objective, 81.0, 1e-6);
+}
+
+namespace {
+
+// Dense row-major data -> CSC. Every (row, column) slot becomes an entry, so explicit
+// zeros and the exact double bit patterns survive and the threshold behaviour can be
+// asserted exactly.
+simplex::lp_problem_t<int, double> make_dense_lp(const std::vector<std::vector<double>>& rows,
+                                                 const std::vector<double>& rhs)
+{
+  const int m = static_cast<int>(rows.size());
+  const int n = m > 0 ? static_cast<int>(rows.front().size()) : 0;
+  simplex::lp_problem_t<int, double> lp(nullptr, m, n, m * n);
+  lp.A.col_start.resize(n + 1);
+  int p = 0;
+  for (int j = 0; j < n; ++j) {
+    lp.A.col_start[j] = p;
+    for (int i = 0; i < m; ++i) {
+      lp.A.i[p] = i;
+      lp.A.x[p] = rows[i][j];
+      ++p;
+    }
+  }
+  lp.A.col_start[n] = p;
+  lp.rhs            = rhs;
+  lp.objective.assign(n, 0.0);
+  lp.lower.assign(n, -std::numeric_limits<double>::infinity());
+  lp.upper.assign(n, std::numeric_limits<double>::infinity());
+  lp.obj_scale = 1.0;
+  return lp;
+}
+
+simplex::lp_problem_t<int, double> make_row_lp(const std::vector<double>& row, double rhs)
+{
+  return make_dense_lp({row}, {rhs});
+}
+
+std::vector<simplex::variable_type_t> all_continuous(int n)
+{
+  return std::vector<simplex::variable_type_t>(n, simplex::variable_type_t::CONTINUOUS);
+}
+
+void expect_valid_csc(const csc_matrix_t<int, double>& A)
+{
+  ASSERT_EQ(static_cast<int>(A.col_start.size()), A.n + 1);
+  EXPECT_EQ(A.col_start.front(), 0);
+  EXPECT_EQ(A.col_start.back(), A.nnz());
+  EXPECT_EQ(static_cast<int>(A.i.size()), A.nnz());
+  EXPECT_EQ(static_cast<int>(A.x.size()), A.nnz());
+  for (int j = 0; j < A.n; ++j) {
+    EXPECT_LE(A.col_start[j], A.col_start[j + 1]) << "column " << j;
+  }
+  for (int p = 0; p < A.nnz(); ++p) {
+    EXPECT_GE(A.i[p], 0);
+    EXPECT_LT(A.i[p], A.m);
+  }
+}
+
+}  // namespace
+
+// Row R53 of the pk1 sub-MIP captured in NVIDIA/cuopt#2290. C32 and C33 carry the
+// ~1e-18 values identified there as floating-point cancellation residue on free columns;
+// the remaining entries are the cut's real coefficients.
+TEST(submip_presolve, convert_lp_to_user_problem_drops_roundoff_residue)
+{
+  const std::vector<double> row = {
+    1.523, -1.734723475976807e-18, -1.894851796836205e-18, 0.015384615384615385};
+  auto lp = make_row_lp(row, 6.2);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(4), settings, user_problem, rel_tol);
+
+  // Dimensions and RHS are untouched; only the two residues disappear. Columns 1 and 2
+  // become empty, which is valid CSC.
+  EXPECT_EQ(user_problem.num_rows, 1);
+  EXPECT_EQ(user_problem.num_cols, 4);
+  EXPECT_DOUBLE_EQ(user_problem.rhs[0], 6.2);
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 1, 1, 2}));
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 1.523);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[1], 0.015384615384615385);
+  EXPECT_EQ(user_problem.A.i, (std::vector<int>{0, 0}));
+  expect_valid_csc(user_problem.A);
+
+  // Bounds, objective and the source LP are not modified.
+  EXPECT_EQ(user_problem.objective, std::vector<double>(4, 0.0));
+  EXPECT_EQ(user_problem.lower, lp.lower);
+  EXPECT_EQ(user_problem.upper, lp.upper);
+  ASSERT_EQ(lp.A.nnz(), 4);
+  EXPECT_DOUBLE_EQ(lp.A.x[1], -1.734723475976807e-18);
+  EXPECT_DOUBLE_EQ(lp.A.x[2], -1.894851796836205e-18);
+}
+
+// The threshold sits at the round-off floor rather than at "small coefficient" level: a
+// genuine 1e-13 entry relative to its row must survive. (A row-relative 1e-12 threshold
+// would drop it, which is why that value is not used here.)
+TEST(submip_presolve, convert_lp_to_user_problem_keeps_meaningful_small_coefficient)
+{
+  auto lp = make_row_lp({1.0, 1e-13}, 1.0);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(2), settings, user_problem, rel_tol);
+
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 2}));
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 1.0);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[1], 1e-13);
+}
+
+// Omitting the tolerance keeps the historical exact conversion.
+TEST(submip_presolve, convert_lp_to_user_problem_default_keeps_all_entries)
+{
+  const std::vector<double> row = {
+    1.523, -1.734723475976807e-18, -1.894851796836205e-18, 0.015384615384615385};
+  auto lp = make_row_lp(row, 6.2);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  simplex::convert_lp_to_user_problem(lp, all_continuous(4), settings, user_problem);
+
+  ASSERT_EQ(user_problem.A.nnz(), 4);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 2, 3, 4}));
+  for (int j = 0; j < 4; ++j) {
+    EXPECT_DOUBLE_EQ(user_problem.A.x[j], row[j]) << "column " << j;
+  }
+  expect_valid_csc(user_problem.A);
+}
+
+// The threshold comparison is inclusive: an entry exactly at rel_tol * row_max goes, the
+// next representable value above it stays.
+TEST(submip_presolve, convert_lp_to_user_problem_threshold_is_inclusive)
+{
+  const double threshold = 8.0 * std::numeric_limits<double>::epsilon();
+  const double above     = std::nextafter(threshold, std::numeric_limits<double>::infinity());
+  auto lp                = make_row_lp({1.0, threshold, above}, 1.0);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  simplex::convert_lp_to_user_problem(lp, all_continuous(3), settings, user_problem, threshold);
+
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 1, 2}));
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 1.0);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[1], above);
+}
+
+// An all-zero row has row scale zero: its explicit zeros are removed but the row itself
+// (and its RHS) stays. A column whose every entry is dropped becomes empty and the CSC
+// metadata must stay consistent.
+TEST(submip_presolve, convert_lp_to_user_problem_handles_zero_rows_and_empty_columns)
+{
+  auto lp = make_dense_lp({{0.0, -0.0, 0.0}, {2.0, 1e-18, 0.0}}, {0.0, 2.0});
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(3), settings, user_problem, rel_tol);
+
+  // Zero row kept, zero-row entries dropped; row 1 keeps only its 2.0.
+  EXPECT_EQ(user_problem.num_rows, 2);
+  EXPECT_EQ(user_problem.num_cols, 3);
+  EXPECT_EQ(user_problem.rhs, (std::vector<double>{0.0, 2.0}));
+  ASSERT_EQ(user_problem.A.nnz(), 1);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 1, 1}));
+  EXPECT_EQ(user_problem.A.i[0], 1);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 2.0);
+  expect_valid_csc(user_problem.A);
+}
+
+// The threshold is relative to the row, so a uniformly tiny row keeps its own scale
+// instead of being wiped out.
+TEST(submip_presolve, convert_lp_to_user_problem_keeps_uniformly_scaled_row)
+{
+  auto lp = make_row_lp({5e-18, 1e-18}, 0.0);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(2), settings, user_problem, rel_tol);
+
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 5e-18);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[1], 1e-18);
+}
+
+// Non-finite entries do not contribute to the row scale and are never dropped; a finite
+// row that also carries inf/NaN still drops its own round-off-level entry.
+TEST(submip_presolve, convert_lp_to_user_problem_keeps_non_finite_entries)
+{
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto lp          = make_row_lp({inf, nan, 1.0, 1e-18}, 1.0);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(4), settings, user_problem, rel_tol);
+
+  ASSERT_EQ(user_problem.A.nnz(), 3);
+  EXPECT_TRUE(std::isinf(user_problem.A.x[0]));
+  EXPECT_TRUE(std::isnan(user_problem.A.x[1]));
+  EXPECT_DOUBLE_EQ(user_problem.A.x[2], 1.0);
+}
+
+// A row is never emptied: its largest entry is never below the threshold, even when that
+// entry is far smaller than the scale of every other row.
+TEST(submip_presolve, convert_lp_to_user_problem_never_empties_a_row)
+{
+  // Row 0 has a single entry (1e-20) and keeps it; row 1 keeps 1.0 and drops its 1e-20.
+  simplex::lp_problem_t<int, double> lp(nullptr, 2, 3, 3);
+  lp.A.col_start = {0, 1, 2, 3};
+  lp.A.i         = {0, 1, 1};
+  lp.A.x         = {1e-20, 1.0, 1e-20};
+  lp.rhs         = {0.0, 1.0};
+  lp.objective.assign(3, 0.0);
+  lp.lower.assign(3, -std::numeric_limits<double>::infinity());
+  lp.upper.assign(3, std::numeric_limits<double>::infinity());
+  lp.obj_scale = 1.0;
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(3), settings, user_problem, rel_tol);
+
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_EQ(user_problem.A.col_start, (std::vector<int>{0, 1, 2, 2}));
+  EXPECT_EQ(user_problem.A.i, (std::vector<int>{0, 1}));
+  EXPECT_DOUBLE_EQ(user_problem.A.x[0], 1e-20);
+  EXPECT_DOUBLE_EQ(user_problem.A.x[1], 1.0);
+  expect_valid_csc(user_problem.A);
+}
+
+// The root cut pass rebuilds the LP matrix through csr_matrix_t::to_compressed_col, which
+// resizes i/x but leaves nz_max at the target's initial capacity. The filter must not use
+// nz_max to decide whether the storage needs shrinking.
+TEST(submip_presolve, convert_lp_to_user_problem_handles_stale_nz_max)
+{
+  const std::vector<double> row = {1.523, -1.734723475976807e-18, 0.015384615384615385};
+  auto lp                       = make_row_lp(row, 6.2);
+  lp.A.nz_max = 1;  // capacity behind the nonzero count, as to_compressed_col leaves it
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.set_log(false);
+  simplex::user_problem_t<int, double> user_problem(nullptr);
+  const double rel_tol = 8.0 * std::numeric_limits<double>::epsilon();
+  simplex::convert_lp_to_user_problem(lp, all_continuous(3), settings, user_problem, rel_tol);
+
+  ASSERT_EQ(user_problem.A.nnz(), 2);
+  EXPECT_EQ(user_problem.A.nz_max, 2);
+  EXPECT_EQ(static_cast<int>(user_problem.A.i.size()), 2);
+  EXPECT_EQ(static_cast<int>(user_problem.A.x.size()), 2);
+  expect_valid_csc(user_problem.A);
 }
 
 }  // namespace cuopt::mathematical_optimization::test

@@ -1175,11 +1175,68 @@ i_t add_artifical_variables(lp_problem_t<i_t, f_t>& problem,
   return 0;
 }
 
+// Drop entries below the round-off level of their own row:
+// |a_ij| <= rel_tol * max_k |a_ik|. The threshold is relative to the row so that a
+// uniformly scaled row is left alone, and rel_tol < 1 guarantees that every row with a
+// nonzero entry keeps its largest one, so no row is emptied.
+//
+// A row whose entries are all zero has row scale zero; its explicit zeros are dropped
+// as well. Columns may become empty, which is valid CSC and handled by the presolvers.
+// Non-finite entries never affect the row scale and are never dropped.
+//
+// An entry this small is indistinguishable from the round-off left by floating-point
+// row combinations, but it is not always noise: for a column that can take a large
+// value even a tiny coefficient can move the row activity. The caller is responsible
+// for choosing a tolerance at the round-off level; this is a numerical-hygiene filter
+// for heuristic sub-problems, not an exact-equivalence pass.
+template <typename i_t, typename f_t>
+static i_t drop_roundoff_entries(csc_matrix_t<i_t, f_t>& A, f_t rel_tol)
+{
+  if (rel_tol <= f_t{0}) { return 0; }
+  assert(rel_tol < f_t{1});
+
+  std::vector<f_t> row_scale(A.m, f_t{0});
+  for (i_t j = 0; j < A.n; ++j) {
+    for (i_t p = A.col_start[j]; p < A.col_start[j + 1]; ++p) {
+      const f_t a = std::abs(A.x[p]);
+      if (std::isfinite(a)) { row_scale[A.i[p]] = std::max(row_scale[A.i[p]], a); }
+    }
+  }
+
+  // Compact in place: the write cursor never overtakes the read cursor.
+  i_t write   = 0;
+  i_t dropped = 0;
+  for (i_t j = 0; j < A.n; ++j) {
+    const i_t col_start = A.col_start[j];
+    const i_t col_end   = A.col_start[j + 1];
+    A.col_start[j]      = write;
+    for (i_t p = col_start; p < col_end; ++p) {
+      const i_t i = A.i[p];
+      const f_t a = A.x[p];
+      if (std::isfinite(a) && std::abs(a) <= rel_tol * row_scale[i]) {
+        ++dropped;
+        continue;
+      }
+      A.i[write] = i;
+      A.x[write] = a;
+      ++write;
+    }
+  }
+  A.col_start[A.n] = write;
+  // Reallocate unconditionally: `nz_max` is not maintained by every matrix builder
+  // (csr_matrix_t::to_compressed_col leaves the capacity behind the actual nnz), so it
+  // cannot be used to decide whether the storage needs shrinking. `write` never exceeds
+  // the input nnz, hence this never grows the storage.
+  A.reallocate(write);
+  return dropped;
+}
+
 template <typename i_t, typename f_t>
 void convert_lp_to_user_problem(const lp_problem_t<i_t, f_t>& lp,
                                 const std::vector<variable_type_t>& var_types,
                                 const simplex_solver_settings_t<i_t, f_t>& settings,
-                                user_problem_t<i_t, f_t>& user_problem)
+                                user_problem_t<i_t, f_t>& user_problem,
+                                f_t drop_rel_tol)
 {
   constexpr bool verbose = false;
   if (verbose) {
@@ -1198,6 +1255,7 @@ void convert_lp_to_user_problem(const lp_problem_t<i_t, f_t>& lp,
   user_problem.objective  = lp.objective;
 
   user_problem.A = lp.A;
+  drop_roundoff_entries(user_problem.A, drop_rel_tol);
 
   user_problem.rhs   = lp.rhs;
   user_problem.lower = lp.lower;
@@ -2517,7 +2575,8 @@ template void convert_lp_to_user_problem<int, double>(
   const lp_problem_t<int, double>& simplex_problem,
   const std::vector<variable_type_t>& var_types,
   const simplex_solver_settings_t<int, double>& settings,
-  user_problem_t<int, double>& user_problem);
+  user_problem_t<int, double>& user_problem,
+  double drop_rel_tol);
 
 template void convert_user_lp_with_guess<int, double>(
   const user_problem_t<int, double>& user_problem,

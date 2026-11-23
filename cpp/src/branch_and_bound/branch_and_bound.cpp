@@ -2480,9 +2480,17 @@ void branch_and_bound_t<i_t, f_t>::solve_submip(diving_worker_t<i_t, f_t>* worke
   // The `worker->leaf_problem` is directly converted to an `user_problem_t`, meaning that
   // there is only equality rows (the range row vector is empty) and it contains
   // structural + slacks + cuts constraints/variables.
+  //
+  // Floating-point row combinations in cut separation can leave coefficients at the
+  // round-off level of their row (around 1e-18 on pk1, see NVIDIA/cuopt#2290). They are
+  // usually noise, but PaPILO's sparsify may pick them as cancellation pivots, so drop
+  // entries within a few ulps of their row. This only cleans the sub-MIP copy:
+  // `worker->leaf_problem` is untouched, and any candidate the sub-MIP returns is
+  // validated against the original LP by set_solution_from_submip.
+  const f_t submip_drop_rel_tol = f_t{8} * std::numeric_limits<f_t>::epsilon();
   user_problem_t<i_t, f_t> submip_problem(original_problem_.handle_ptr);
   simplex::convert_lp_to_user_problem(
-    worker->leaf_problem, worker->var_types, settings_, submip_problem);
+    worker->leaf_problem, worker->var_types, settings_, submip_problem, submip_drop_rel_tol);
 
   third_party_presolve_t<i_t, f_t> presolver;
   f_t presolve_time_limit = std::min(0.1 * submip_settings.time_limit, 60.0);
